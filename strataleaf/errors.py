@@ -21,3 +21,6 @@ class ReadOnly(DatabaseError):
 
 class ReplicationError(DatabaseError):
     pass
+
+class ChainError(DatabaseError):
+    """A backup chain is incomplete, misordered, inconsistent or corrupt."""

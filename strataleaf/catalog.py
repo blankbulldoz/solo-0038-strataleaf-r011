@@ -4,6 +4,21 @@ from .mvcc import visible_rows
 from .schema import normalize_schema, validate_document
 
 
+def catalog_state(connection):
+    return {"collections": [{"name": row["name"], "schema": loads(row["schema"]), "generation": row["generation"]}
+                            for row in connection.execute("SELECT * FROM collections ORDER BY name")],
+            "indexes": [dict(row) for row in connection.execute("SELECT * FROM index_defs ORDER BY collection,name")]}
+
+
+def record_catalog_event(store, connection):
+    """Persist the full catalog state at the current epoch inside the caller's transaction."""
+    state = catalog_state(connection)
+    connection.execute("INSERT INTO catalog_events VALUES (?,?,?,?) ON CONFLICT(epoch) DO UPDATE SET "
+                       "rev=excluded.rev, collections=excluded.collections, indexes=excluded.indexes",
+                       (int(store.get("catalog_epoch")), int(store.get("head")),
+                        dumps(state["collections"]), dumps(state["indexes"])))
+
+
 class Catalog:
     def __init__(self, store):
         self.store = store
@@ -16,6 +31,7 @@ class Catalog:
                 raise Conflict("collection already exists: " + collection)
             connection.execute("INSERT INTO collections VALUES (?,?,1)", (collection, dumps(normalized)))
             self.store.set("catalog_epoch", int(self.store.get("catalog_epoch")) + 1)
+            record_catalog_event(self.store, connection)
         return self.describe(collection)
 
     def describe(self, collection):
@@ -44,4 +60,5 @@ class Catalog:
             connection.execute("UPDATE collections SET schema=?,generation=? WHERE name=?",
                                (dumps(normalized), generation, collection))
             self.store.set("catalog_epoch", int(self.store.get("catalog_epoch")) + 1)
+            record_catalog_event(self.store, connection)
         return generation

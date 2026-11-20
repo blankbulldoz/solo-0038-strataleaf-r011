@@ -24,6 +24,14 @@ CREATE TABLE IF NOT EXISTS index_values (
 CREATE INDEX IF NOT EXISTS index_document ON index_values(collection,key);
 CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, rev INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS consumers (name TEXT PRIMARY KEY, ack INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS catalog_events (
+ epoch INTEGER PRIMARY KEY, rev INTEGER NOT NULL, collections TEXT NOT NULL, indexes TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS catalog_event_revision ON catalog_events(rev);
+CREATE TABLE IF NOT EXISTS chain_state (
+ chain_id TEXT PRIMARY KEY, baseline_sha256 TEXT NOT NULL, baseline_rev INTEGER NOT NULL,
+ baseline_epoch INTEGER NOT NULL, seq INTEGER NOT NULL, "through" INTEGER NOT NULL,
+ body_sha256 TEXT NOT NULL, catalog_epoch INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS chain_holds (chain_id TEXT PRIMARY KEY, rev INTEGER NOT NULL);
 """
 
 
@@ -45,6 +53,18 @@ class Storage:
                 self.connection.execute("INSERT OR IGNORE INTO meta VALUES (?,?)", (key, value))
             if self.get("format") != "1":
                 raise DatabaseError("unsupported on-disk format")
+            self.connection.execute("INSERT OR IGNORE INTO catalog_events VALUES (0,0,'[]','[]')")
+            # Upgrade path: a database written before catalog history existed has no event
+            # for its current epoch. Record its present catalog state exactly once.
+            epoch = int(self.get("catalog_epoch"))
+            if not self.connection.execute("SELECT 1 FROM catalog_events WHERE epoch=?",
+                                           (epoch,)).fetchone():
+                from .catalog import catalog_state
+                from .codec import dumps
+                state = catalog_state(self.connection)
+                self.connection.execute("INSERT OR REPLACE INTO catalog_events VALUES (?,?,?,?)",
+                                        (epoch, int(self.get("head")),
+                                         dumps(state["collections"]), dumps(state["indexes"])))
 
     def get(self, key):
         row = self.connection.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()

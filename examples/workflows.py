@@ -2,7 +2,8 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from strataleaf import Database, Archives, Conflict, InvalidDocument, InvalidCursor, ReadOnly, SnapshotTooOld, ReplicationError
+from strataleaf import (Database, Archives, BackupChain, ChainError, Conflict, InvalidDocument,
+                        InvalidCursor, ReadOnly, SnapshotTooOld, ReplicationError)
 
 SCHEMA = {"fields": {"region": "string", "sequence": "integer", "code": "string"}, "required": ["region", "sequence"]}
 
@@ -102,6 +103,124 @@ def run(flow):
                     if replica.diagnostics.fingerprint() != db.diagnostics.fingerprint() or not replica.diagnostics.inspect(True)["ok"]:
                         raise RuntimeError("replica differs from source")
                     output = {"first_packet": applied, "repeat": repeat, "readonly": readonly, "fingerprint": replica.diagnostics.fingerprint()}
+            elif flow == "chain":
+                baseline_path = folder / "baseline.db"
+                baseline = db.archives.backup(baseline_path)
+                started = db.chain.begin(baseline_path)
+                chain_id = started["chain_id"]
+
+                # Segment 1: delete one document, rewrite another, create a collection.
+                db.catalog.create("marks")
+                db.batch().delete("segments", "seg_00", expected=first).put(
+                    "segments", "seg_01", {"region": "north", "sequence": 41, "code": "c1"},
+                    expected=first).put("marks", "m0", {"segment": "seg_01"}).commit()
+                seg_1 = db.chain.append(chain_id)["envelope"]
+
+                # Segment 2: schema evolution, then a write that uses the new field.
+                generation = db.catalog.evolve(
+                    "segments", {**SCHEMA, "fields": {**SCHEMA["fields"], "note": "string"}}, 1)
+                db.batch().put("segments", "seg_02",
+                               {"region": "east", "sequence": 2, "code": "c2", "note": "warm"},
+                               expected=first).commit()
+                seg_2 = db.chain.append(chain_id)["envelope"]
+
+                # Segment 3: build indexes, observe a unique collision, delete a document.
+                db.indexes.create("segments", "by_region", "region")
+                db.indexes.create("segments", "by_code", "code", unique=True)
+                collision = rejected(lambda: db.batch().put(
+                    "segments", "dup", {"region": "north", "sequence": 9, "code": "c2"}).commit(),
+                    Conflict)
+                db.batch().put("marks", "m1", {"segment": "seg_02"}).commit()
+                db.batch().delete("segments", "seg_03").commit()
+                seg_3 = db.chain.append(chain_id)["envelope"]
+
+                # Segment 4: drop the unique index; the previously rejected write now fits.
+                db.indexes.drop("segments", "by_code")
+                db.batch().put("segments", "seg_04",
+                               {"region": "south", "sequence": 44, "code": "c2"}).commit()
+                seg_4 = db.chain.append(chain_id)["envelope"]
+
+                head = db.revision
+                segments = [seg_1, seg_2, seg_3, seg_4]
+                source_fingerprint = db.diagnostics.fingerprint()
+                source_state = db.diagnostics.inspect(True)
+                source_catalog = db.catalog.list()
+                source_indexes = {name: db.indexes.list(name) for name in ("segments", "marks")}
+                old_value = db.get("segments", "seg_02", first)
+                deleted_history = db.get("segments", "seg_03", first)
+                targets = [db.chain.plan(baseline_path, segments[:n])["target"]
+                           for n in range(1, 5)]
+                compacted = db.retention.compact(head)
+                chain_status = db.chain.status(chain_id)
+
+                restored_path = folder / "restored.db"
+                receipt = BackupChain.restore(baseline_path, segments, restored_path)
+                with Database(restored_path) as restored:
+                    restored_fingerprint = restored.diagnostics.fingerprint()
+                    restored_state = restored.diagnostics.inspect(True)
+                    if restored_fingerprint != source_fingerprint:
+                        raise RuntimeError("restored read view differs from source")
+                    if not restored_state["ok"] or restored_state["counts"] != source_state["counts"]:
+                        raise RuntimeError("restored database failed integrity re-derivation")
+                    if restored.catalog.list() != source_catalog:
+                        raise RuntimeError("restored catalog differs from source")
+                    if {n: restored.indexes.list(n) for n in ("segments", "marks")} != source_indexes:
+                        raise RuntimeError("restored indexes differ from source")
+                    if restored.get("segments", "seg_00") is not None:
+                        raise RuntimeError("restored deletion was not preserved")
+                    if restored.revision != head:
+                        raise RuntimeError("restored revision differs from the chain target")
+                    if restored.get("segments", "seg_02", first).document != old_value.document:
+                        raise RuntimeError("restored historical read differs from source")
+                    if restored.get("segments", "seg_03", first).document != deleted_history.document:
+                        raise RuntimeError("restored tombstoned history differs from source")
+                    if restored.catalog.describe("segments")["generation"] != generation:
+                        raise RuntimeError("restored schema generation differs")
+
+                mid_path = folder / "mid.db"
+                # One revision into segment 3, before the seg_03 tombstone in that segment.
+                mid_target = seg_2["body"]["through"] + 1
+                mid = BackupChain.restore(baseline_path, segments[:3], mid_path, through=mid_target)
+                with Database(mid_path) as mid_db:
+                    mid_fingerprint = mid_db.diagnostics.fingerprint()
+                    if mid_db.revision != mid_target or not mid_db.diagnostics.inspect(True)["ok"]:
+                        raise RuntimeError("mid-chain restore did not land on the requested revision")
+                    if mid_db.catalog.describe("segments")["generation"] != generation:
+                        raise RuntimeError("mid-chain restore lost schema evolution")
+                    if mid_db.get("segments", "seg_03") is None:
+                        raise RuntimeError("mid-chain target replayed a later deletion")
+
+                baseline_before = (baseline_path.stat().st_size, baseline_path.read_bytes())
+                blocked = folder / "blocked.db"
+                failures = {
+                    "missing_segment": rejected(lambda: BackupChain.restore(
+                        baseline_path, [seg_1, seg_3], blocked), ChainError),
+                    "out_of_order": rejected(lambda: BackupChain.restore(
+                        baseline_path, [seg_1, seg_3, seg_2], blocked), ChainError),
+                    "checksum": rejected(lambda: BackupChain.restore(
+                        baseline_path, [{**seg_1, "sha256": "0" * 64}], blocked), ChainError),
+                }
+                if blocked.exists():
+                    raise RuntimeError("a rejected chain restore created its destination")
+                if (baseline_path.stat().st_size, baseline_path.read_bytes()) != baseline_before:
+                    raise RuntimeError("a rejected chain restore mutated the baseline")
+                output = {
+                    "baseline": {"revision": baseline["revision"], "sha256": baseline["sha256"]},
+                    "chain": {"id": chain_id,
+                              "ranges": [{"from": s["body"]["from_rev"], "through": s["body"]["through"]}
+                                         for s in segments]},
+                    "reachable_targets": targets,
+                    "retention": {"requested": compacted["requested"], "floor": compacted["floor"],
+                                  "chain_hold": chain_status["hold"]},
+                    "restored": {"revision": receipt["revision"], "segments": receipt["segments"],
+                                 "fingerprint": restored_fingerprint["sha256"],
+                                 "documents": restored_fingerprint["documents"],
+                                 "source_fingerprint": source_fingerprint["sha256"],
+                                 "counts": restored_state["counts"]},
+                    "mid_chain": {"target": mid_target, "revision": mid["revision"],
+                                  "fingerprint": mid_fingerprint["sha256"]},
+                    "rejections": failures, "collision": collision,
+                }
             elif flow == "compact":
                 db.retention.pin("reader", first)
                 db.feed.register("slow_copy", first)

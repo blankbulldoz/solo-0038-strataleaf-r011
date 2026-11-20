@@ -59,6 +59,9 @@ class Replication:
                     applied += 1
                 self.store.set("head", body["through"])
                 self.store.set("catalog_epoch", body["catalog_epoch"] if body["through"] == body["head"] else -1)
+                from .catalog import record_catalog_event
+                if body["through"] == body["head"]:
+                    record_catalog_event(self.store, connection)
                 from .mvcc import visible_rows
                 for collection in connection.execute("SELECT name FROM collections").fetchall():
                     for row in visible_rows(connection, collection[0], body["through"]):

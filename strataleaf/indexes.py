@@ -1,3 +1,4 @@
+from .catalog import record_catalog_event
 from .codec import MISSING, field, loads, name, scalar_token
 from .errors import Conflict, InvalidDocument, NotFound
 from .mvcc import visible_rows
@@ -44,6 +45,7 @@ class Indexes:
                 seen.add(token)
                 connection.execute("INSERT INTO index_values VALUES (?,?,?,?)", (collection, index_name, token, row["key"]))
             self.store.set("catalog_epoch", int(self.store.get("catalog_epoch")) + 1)
+            record_catalog_event(self.store, connection)
         return {"name": index_name, "field": path, "unique": unique}
 
     def drop(self, collection, index_name):
@@ -52,6 +54,7 @@ class Indexes:
             if not changed:
                 raise NotFound("unknown index")
             self.store.set("catalog_epoch", int(self.store.get("catalog_epoch")) + 1)
+            record_catalog_event(self.store, connection)
 
     def list(self, collection):
         with self.store.read() as connection:
@@ -69,3 +72,28 @@ def equality_candidates(connection, collection, path, value):
     keys = {row[0] for row in connection.execute("SELECT key FROM index_values WHERE collection=? AND name=? AND token=?",
                                                (collection, definition[0], token))}
     return definition[0], keys
+
+
+def rebuild_current_indexes(connection):
+    """Rebuild the whole current-head index projection from visible documents.
+
+    Used by chain restore and replica catch-up: definitions must already be present.
+    Raises Conflict on a unique violation rather than leaving a partial projection.
+    """
+    from .mvcc import visible_rows
+    from .codec import loads
+    head = int(connection.execute("SELECT value FROM meta WHERE key='head'").fetchone()[0])
+    connection.execute("DELETE FROM index_values")
+    seen = {}
+    for definition in connection.execute("SELECT * FROM index_defs").fetchall():
+        for row in visible_rows(connection, definition["collection"], head):
+            token = scalar_token(field(loads(row["body"]), definition["field"]))
+            if token is None:
+                continue
+            if definition["unique_flag"]:
+                bucket = seen.setdefault((definition["collection"], definition["name"]), set())
+                if token in bucket:
+                    raise Conflict("unique index conflict: " + definition["name"])
+                bucket.add(token)
+            connection.execute("INSERT INTO index_values VALUES (?,?,?,?)",
+                               (definition["collection"], definition["name"], token, row["key"]))

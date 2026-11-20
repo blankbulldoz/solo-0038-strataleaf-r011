@@ -26,7 +26,8 @@ class Retention:
     def compact(self, target):
         with self.store.atomic(writable=True) as connection:
             target = checked_revision(self.store, target)
-            blockers = [row[0] for row in connection.execute("SELECT rev FROM pins UNION ALL SELECT ack FROM consumers")]
+            blockers = [row[0] for row in connection.execute(
+                "SELECT rev FROM pins UNION ALL SELECT ack FROM consumers UNION ALL SELECT rev FROM chain_holds")]
             boundary = min([target] + blockers)
             prior = int(self.store.get("floor"))
             if boundary < prior:

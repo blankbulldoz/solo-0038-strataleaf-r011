@@ -1,5 +1,5 @@
 from .aggregate import Aggregates
-from .archive import Archives
+from .archive import Archives, BackupChain
 from .catalog import Catalog
 from .diagnostics import Diagnostics
 from .feeds import ChangeFeed
@@ -23,6 +23,7 @@ class Database:
         self.feed = ChangeFeed(self._store)
         self.retention = Retention(self._store)
         self.archives = Archives(self._store)
+        self.chain = BackupChain(self._store)
         self.replication = Replication(self._store)
         self.aggregates = Aggregates(self._store)
         self.transfer = Transfer(self._store)
